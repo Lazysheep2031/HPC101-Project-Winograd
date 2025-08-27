@@ -27,7 +27,7 @@ __constant__ float A_T[2][4] = {
     {0.0f, 1.0f, -1.0f, -1.0f}
 };
 
-// Step 1: 循环展开优化的Winograd卷积核函数
+// Step 2: 直接矩阵计算优化的Winograd卷积核函数
 __global__
 void winograd_conv_kernel(const float* __restrict__ image,
                           const float* __restrict__ filter,
@@ -48,62 +48,88 @@ void winograd_conv_kernel(const float* __restrict__ image,
 
     // 遍历所有输入通道
     for (int c = 0; c < C; ++c) {
-        // === 滤波器变换 ===
+        // === 滤波器变换 - 直接计算优化 ===
         const float* g = filter + (k * C + c) * 9;
         float u_kc[4][4];
-        float temp_g[4][3];
         
-        // 计算 G * g，使用循环展开优化
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            temp_g[i][0] = G[i][0] * g[0] + G[i][1] * g[3] + G[i][2] * g[6];
-            temp_g[i][1] = G[i][0] * g[1] + G[i][1] * g[4] + G[i][2] * g[7];
-            temp_g[i][2] = G[i][0] * g[2] + G[i][1] * g[5] + G[i][2] * g[8];
-        }
+        // 直接计算 G * g * G^T（避免中间临时数组temp_g）
+        // 行0: g[0], 0.5*(g[0]+g[1]+g[2]), 0.5*(g[0]-g[1]+g[2]), g[2]
+        u_kc[0][0] = g[0]; 
+        u_kc[0][1] = 0.5f * (g[0] + g[1] + g[2]);
+        u_kc[0][2] = 0.5f * (g[0] - g[1] + g[2]);
+        u_kc[0][3] = g[2];
         
-        // 计算 (G * g) * G^T，使用循环展开优化
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            u_kc[i][0] = temp_g[i][0];
-            u_kc[i][1] = 0.5f * (temp_g[i][0] + temp_g[i][1] + temp_g[i][2]);
-            u_kc[i][2] = 0.5f * (temp_g[i][0] - temp_g[i][1] + temp_g[i][2]);
-            u_kc[i][3] = temp_g[i][2];
-        }
+        // 行1: 使用预计算的中间变量
+        float t1 = g[0] + g[3] + g[6];
+        float t2 = g[1] + g[4] + g[7];
+        float t3 = g[2] + g[5] + g[8];
+        u_kc[1][0] = 0.5f * t1;
+        u_kc[1][1] = 0.5f * 0.5f * (t1 + t2 + t3);
+        u_kc[1][2] = 0.5f * 0.5f * (t1 - t2 + t3);
+        u_kc[1][3] = 0.5f * t3;
+        
+        // 行2: 使用预计算的中间变量
+        float t4 = g[0] - g[3] + g[6];
+        float t5 = g[1] - g[4] + g[7];
+        float t6 = g[2] - g[5] + g[8];
+        u_kc[2][0] = 0.5f * t4;
+        u_kc[2][1] = 0.5f * 0.5f * (t4 + t5 + t6);
+        u_kc[2][2] = 0.5f * 0.5f * (t4 - t5 + t6);
+        u_kc[2][3] = 0.5f * t6;
+        
+        // 行3: g[6], 0.5*(g[6]+g[7]+g[8]), 0.5*(g[6]-g[7]+g[8]), g[8]
+        u_kc[3][0] = g[6];
+        u_kc[3][1] = 0.5f * (g[6] + g[7] + g[8]);
+        u_kc[3][2] = 0.5f * (g[6] - g[7] + g[8]);
+        u_kc[3][3] = g[8];
 
-        // === 图像变换 ===
+        // === 图像变换 - 直接计算优化 ===
         int h_start = tile_y * 2;
         int w_start = tile_x * 2;
         float d[4][4];
         
-        // 加载图像数据，优化内存合并访问
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                d[i][j] = image[(n * C + c) * H * W + (h_start + i) * W + (w_start + j)];
-            }
-        }
+        // 高效加载图像数据
+        int base_idx = (n * C + c) * H * W + h_start * W + w_start;
+        d[0][0] = image[base_idx];
+        d[0][1] = image[base_idx + 1];
+        d[0][2] = image[base_idx + 2];
+        d[0][3] = image[base_idx + 3];
+        d[1][0] = image[base_idx + W];
+        d[1][1] = image[base_idx + W + 1];
+        d[1][2] = image[base_idx + W + 2];
+        d[1][3] = image[base_idx + W + 3];
+        d[2][0] = image[base_idx + 2*W];
+        d[2][1] = image[base_idx + 2*W + 1];
+        d[2][2] = image[base_idx + 2*W + 2];
+        d[2][3] = image[base_idx + 2*W + 3];
+        d[3][0] = image[base_idx + 3*W];
+        d[3][1] = image[base_idx + 3*W + 1];
+        d[3][2] = image[base_idx + 3*W + 2];
+        d[3][3] = image[base_idx + 3*W + 3];
         
         float v_ncp[4][4];
-        float temp_d[4][4];
         
-        // 计算 B^T * d，使用循环展开优化
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                temp_d[i][j] = B_T[i][0] * d[0][j] + B_T[i][1] * d[1][j] + B_T[i][2] * d[2][j] + B_T[i][3] * d[3][j];
-            }
-        }
+        // 直接计算 B^T * d * B（避免中间临时数组temp_d）
+        // 使用优化的直接公式计算 B^T * d * B
+        v_ncp[0][0] = d[0][0] - d[0][2] - d[2][0] + d[2][2];
+        v_ncp[0][1] = d[0][1] + d[0][2] - d[2][1] - d[2][2];
+        v_ncp[0][2] = d[0][2] - d[0][1] - d[2][2] + d[2][1];
+        v_ncp[0][3] = d[0][1] - d[0][3] - d[2][1] + d[2][3];
         
-        // 计算 (B^T * d) * B，使用循环展开优化
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                v_ncp[i][j] = temp_d[i][0] * B[0][j] + temp_d[i][1] * B[1][j] + temp_d[i][2] * B[2][j] + temp_d[i][3] * B[3][j];
-            }
-        }
+        v_ncp[1][0] = d[1][0] + d[2][0] - d[1][2] - d[2][2];
+        v_ncp[1][1] = d[1][1] + d[1][2] + d[2][1] + d[2][2];
+        v_ncp[1][2] = d[1][2] - d[1][1] + d[2][2] - d[2][1];
+        v_ncp[1][3] = d[1][1] - d[1][3] + d[2][1] - d[2][3];
+        
+        v_ncp[2][0] = d[2][0] - d[1][0] - d[2][2] + d[1][2];
+        v_ncp[2][1] = d[2][1] + d[2][2] - d[1][1] - d[1][2];
+        v_ncp[2][2] = d[2][2] - d[2][1] - d[1][2] + d[1][1];
+        v_ncp[2][3] = d[2][1] - d[2][3] - d[1][1] + d[1][3];
+        
+        v_ncp[3][0] = d[1][0] - d[1][2] - d[3][0] + d[3][2];
+        v_ncp[3][1] = d[1][1] + d[1][2] - d[3][1] - d[3][2];
+        v_ncp[3][2] = d[1][2] - d[1][1] - d[3][2] + d[3][1];
+        v_ncp[3][3] = d[1][1] - d[1][3] - d[3][1] + d[3][3];
 
         // === 逐元素相乘并累加 ===
         #pragma unroll
@@ -115,25 +141,15 @@ void winograd_conv_kernel(const float* __restrict__ image,
         }
     }
 
-    // === 输出变换 ===
-    float temp_m[2][4];
-    
-    // 计算 A^T * m，使用循环展开优化
-    #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            temp_m[i][j] = A_T[i][0] * m[0][j] + A_T[i][1] * m[1][j] + A_T[i][2] * m[2][j] + A_T[i][3] * m[3][j];
-        }
-    }
-    
+    // === 输出变换 - 直接计算优化 ===
     float Y[2][2];
-    // 计算 (A^T * m) * A，使用循环展开优化
-    #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-        Y[i][0] = temp_m[i][0] + temp_m[i][1] + temp_m[i][2];
-        Y[i][1] = temp_m[i][1] - temp_m[i][2] - temp_m[i][3];
-    }
+    
+    // 直接计算 A^T * m * A（避免中间临时数组temp_m）
+    // Y = A^T * m * A，其中 A^T = [[1,1,1,0], [0,1,-1,-1]]
+    Y[0][0] = m[0][0] + m[0][1] + m[0][2] + m[1][0] + m[1][1] + m[1][2] + m[2][0] + m[2][1] + m[2][2];
+    Y[0][1] = m[0][1] - m[0][2] - m[0][3] + m[1][1] - m[1][2] - m[1][3] + m[2][1] - m[2][2] - m[2][3];
+    Y[1][0] = m[1][0] + m[1][1] + m[1][2] - m[2][0] - m[2][1] - m[2][2] - m[3][0] - m[3][1] - m[3][2];
+    Y[1][1] = m[1][1] - m[1][2] - m[1][3] - m[2][1] + m[2][2] + m[2][3] - m[3][1] + m[3][2] + m[3][3];
 
     // === 写入输出并进行边界检查 ===
     #pragma unroll
@@ -149,7 +165,6 @@ void winograd_conv_kernel(const float* __restrict__ image,
     }
 }
 
-// Winograd卷积主函数接口
 void winograd_conv(thrust::device_vector<float>& image,
                    thrust::device_vector<float>& filter, 
                    thrust::device_vector<float>& out,
@@ -160,12 +175,11 @@ void winograd_conv(thrust::device_vector<float>& image,
     const int outH = H - 2;
     const int outW = W - 2;
     
-    // 设置GPU执行参数
-    const int threads_per_block = 256;
+    // Optimize block size for better occupancy
+    const int threads_per_block = 128; // Reduced from 256 for better cache usage
     int num_tiles = N * K * (outH / 2) * (outW / 2);
     int grid_size = (num_tiles + threads_per_block - 1) / threads_per_block;
 
-    // 启动CUDA核函数
     winograd_conv_kernel<<<grid_size, threads_per_block>>>(
         image.data().get(), filter.data().get(), out.data().get(),
         N, C, H, W, K, outH, outW
