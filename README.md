@@ -1,4 +1,4 @@
-# 大作业题目一：Winograd 卷积优化 (GPU 版本)
+# 题目一：Winograd 卷积优化 (GPU 版本)
 
 ## 简介
 本目录下提供了 Winograd 算法的 GPU CUDA 实现，使用 Thrust device vectors 进行内存管理。主要包括以下文件：
